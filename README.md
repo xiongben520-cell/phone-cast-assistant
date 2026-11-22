@@ -84,6 +84,46 @@ $s   = "<serial>"
 - `input text` 对中文支持不好，中文建议用剪贴板方案或 ADBKeyboard
 - 投屏时手机默认保持亮屏；需要息屏省电可用 GUI 的「手机：黑屏」按钮（但要操作安全界面时请先切回亮屏）
 
+### 内置 MCP Bridge（v1.6 起）
+
+上面的命令示例现在已做成**内置 MCP Server**。在 GUI 点「Agent 桥接：开」，
+程序会以 `--agent-bridge` 模式拉起一个子进程，通过 **stdio JSON-RPC** 暴露 15 个工具。
+
+给 MCP 客户端的配置示例（`command` 指向 exe 本身）：
+
+```json
+{
+  "mcpServers": {
+    "phone-cast": {
+      "command": "C:\\path\\to\\手机投屏助手.exe",
+      "args": ["--agent-bridge"]
+    }
+  }
+}
+```
+
+也可用 `手机投屏助手.exe --agent-bridge --http 8765` 起 HTTP 调试接口
+（`GET /health`、`POST /mcp` 收 JSON-RPC）。
+
+**工具一览**
+
+| 类别 | 工具 |
+|---|---|
+| 连接 | `list_devices`、`get_status`、`switch_transport`（usb↔wifi，需批准） |
+| 感知 | `snapshot`（控件文字 + 编号 + 中心坐标 + 标注截图）、`screenshot` |
+| 操作 | `tap`、`long_press`、`swipe`、`drag`、`press`、`type`、`clear` |
+| 定位 | `click_by_selector`（text/resourceId/className/description）、`wait_for_element` |
+| 安全 | `shell`（白名单只读命令） |
+
+**人在回路（关键设计）**
+
+- 每次工具调用都写入 `agent_events.jsonl`，GUI 每秒刷新，操作全程可见
+- 命中密码 / 验证码 / 支付 / 权限等敏感控件时，Bridge 挂起并弹审批框，人工点「是」才继续
+- GUI 的「暂停 Agent」按钮可随时冻结所有操作，人直接接管投屏窗口
+- `shell` 命令白名单 + 危险命令黑名单，禁止 reboot / rm / su / 卸载应用
+
+建议 Agent 工作流：`snapshot` → 模型判断 → `click_by_selector` / `tap` → `snapshot` 复核。
+
 ## 快速开始
 
 1. 到 [Releases](../../releases) 下载 `phone-cast-assistant_v1.5.0.zip`

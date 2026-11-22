@@ -1,5 +1,15 @@
 # 更新日志
 
+## v1.6.0 (2026-11-22)
+
+- **P0 升级：Agent 控制产品化**。内置 MCP Bridge（`agent_bridge.py`），GUI 的「Agent 桥接」开关以 `--agent-bridge` 模式拉起 stdio JSON-RPC Server，暴露 15 个工具
+- 新增结构化 `snapshot`：返回控件文字 / 资源 ID / 中心坐标 / 可点击状态，可选在截图上画编号；`click_by_selector` 支持按 text/resourceId/className/description 定位
+- 新增人在回路：敏感操作（密码/验证码/支付/权限）弹审批框，GUI 可一键暂停/恢复 Agent，所有工具调用写入审计日志并实时展示
+- 新增 `shell` 白名单与危险命令拦截；`switch_transport` 支持有线/Wi-Fi 互切（需批准）
+- 中文输入支持 ADBKeyboard（可选放 `tools/ADBKeyboard.apk`），英文用转义后的 `input text`
+- GUI 连接后写 `device_state.json`，Bridge 复用同一条 adb 通道，不重复配对
+- 修复 Windows 下 MCP stdio 输出被本地 GBK 编码导致客户端 UnicodeDecodeError 的问题
+
 ## v1.5.0 (2026-11-22)
 
 - 新增 GUI 按钮控制手机亮屏 / 黑屏（只关显示面板、不锁屏）

@@ -13,6 +13,7 @@
 打包: PyInstaller --noconsole --onefile
 依赖: exe 同目录下的 tools\\adb.exe 与 tools\\scrcpy\\
 """
+import json
 import os
 import re
 import subprocess
@@ -23,7 +24,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
 APP_NAME = "手机投屏连接助手"
-APP_VER = "1.5"
+APP_VER = "1.6"
 
 
 # ============ 路径解析 (同时支持源码运行与 exe 运行) ============
@@ -42,6 +43,12 @@ SCRCPY = os.path.join(SCRCPY_DIR, "scrcpy.exe")
 CRASH_LOG = os.path.join(BASE, "crash.log")
 OVERLAY_CMD = os.path.join(BASE, "overlay_cmd.txt")
 OVERLAY_STATUS = os.path.join(BASE, "overlay_status.txt")
+# Agent Bridge 与 GUI 之间的共享文件
+DEVICE_STATE = os.path.join(BASE, "device_state.json")
+AGENT_CMD = os.path.join(BASE, "agent_cmd.txt")
+AGENT_EVENTS = os.path.join(BASE, "agent_events.jsonl")
+AGENT_APPROVAL = os.path.join(BASE, "agent_approval.json")
+AGENT_APPROVAL_RESULT = os.path.join(BASE, "agent_approval_result.json")
 
 try:
     import win32util
@@ -262,11 +269,15 @@ class App(tk.Tk):
         self.screen_on = True          # 新版默认亮屏，方便看到锁屏/密码界面并点击
         self._anchor_thread = None
         self._anchor_stop = threading.Event()
+        self.agent_proc = None
+        self._agent_event_lines = 0
+        self._agent_approval_id = None
 
         self._build_ui()
         self._check_env()
         self.refresh_devices()
         self._start_watchdog()
+        self._start_agent_monitor()
 
     # ---------- 设备巡检 ----------
     def _start_watchdog(self):
@@ -371,6 +382,18 @@ class App(tk.Tk):
         self.follow_var = tk.StringVar(value="贴图跟随：开")
         ttk.Button(row3, textvariable=self.follow_var, command=self.toggle_follow,
                    width=14).pack(side="left")
+
+        # 第三排: AI Agent 桥接（人在回路）
+        row4 = ttk.Frame(top)
+        row4.pack(fill="x", pady=(6, 0))
+        self.agent_var = tk.StringVar(value="Agent 桥接：关")
+        ttk.Button(row4, textvariable=self.agent_var, command=self.toggle_agent_bridge,
+                   width=16).pack(side="left")
+        self.agent_pause_var = tk.StringVar(value="暂停 Agent")
+        ttk.Button(row4, textvariable=self.agent_pause_var,
+                   command=self.toggle_agent_pause, width=12).pack(side="left", padx=6)
+        self.agent_last_var = tk.StringVar(value="Agent 空闲")
+        ttk.Label(row4, textvariable=self.agent_last_var, foreground="#666").pack(side="left")
 
         # 配对 (两种方式: 手动填写 / 二维码扫码)
         pair = ttk.LabelFrame(self, text=" 首次配对 (新手机需要一次) ", padding=10)
@@ -599,6 +622,129 @@ class App(tk.Tk):
         if self.serial:
             self.log(f"选中设备: {self.serial}")
             self.refresh_volume()
+
+    # ---------- AI Agent 桥接 ----------
+    def toggle_agent_bridge(self):
+        """启动/停止 MCP Bridge 子进程（stdio 模式，给外部 Agent 客户端连）"""
+        if self.agent_proc and self.agent_proc.poll() is None:
+            try:
+                self._write_agent_cmd("stop")
+                self.agent_proc.terminate()
+                self.agent_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.agent_proc.kill()
+                except Exception:
+                    pass
+            self.agent_proc = None
+            self.agent_var.set("Agent 桥接：关")
+            self.agent_pause_var.set("暂停 Agent")
+            self.log("Agent 桥接已停止")
+            return
+
+        exe = sys.executable if getattr(sys, "frozen", False) else None
+        try:
+            if exe:
+                self.agent_proc = subprocess.Popen([exe, "--agent-bridge"],
+                                                   stdin=subprocess.PIPE,
+                                                   stdout=subprocess.PIPE,
+                                                   stderr=subprocess.PIPE,
+                                                   creationflags=CREATE_NO_WINDOW)
+            else:
+                bridge = os.path.join(BASE, "agent_bridge.py")
+                self.agent_proc = subprocess.Popen([sys.executable, bridge],
+                                                   stdin=subprocess.PIPE,
+                                                   stdout=subprocess.PIPE,
+                                                   stderr=subprocess.PIPE,
+                                                   creationflags=CREATE_NO_WINDOW)
+            self.agent_var.set("Agent 桥接：开")
+            self.log("Agent 桥接已启动（MCP stdio，15 个工具）")
+            self.log("   外部客户端用本程序的 --agent-bridge 模式作为 MCP server 接入")
+        except Exception as e:
+            self.log(f"Agent 桥接启动失败: {e}")
+
+    def toggle_agent_pause(self):
+        """一键暂停/恢复 Agent 的所有操作"""
+        paused = self.agent_pause_var.get() == "暂停 Agent"
+        self.agent_pause_var.set("恢复 Agent" if paused else "暂停 Agent")
+        self._write_agent_cmd("pause" if paused else "resume")
+        self.log("Agent 操作已" + ("暂停（你在投屏窗口可以安全操作）" if paused else "恢复"))
+
+    @staticmethod
+    def _write_agent_cmd(cmd):
+        try:
+            with open(AGENT_CMD, "w", encoding="utf-8") as f:
+                f.write(cmd)
+        except Exception:
+            pass
+
+    def _save_device_state(self, connected=True, bitrate=None):
+        """把当前连接信息写给 Agent Bridge，让它复用同一条 adb 通道"""
+        st = {"serial": self.serial, "connected": connected,
+              "link": "usb" if is_usb_serial(self.serial or "") else "wifi",
+              "bitrate": bitrate, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+        try:
+            with open(DEVICE_STATE, "w", encoding="utf-8") as f:
+                json.dump(st, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _start_agent_monitor(self):
+        """每秒轮询：Agent 审计事件 + 人工审批请求"""
+        def tick():
+            try:
+                self._poll_agent_events()
+                self._poll_agent_approval()
+            except Exception:
+                pass
+            self.after(1000, tick)
+        self.after(1200, tick)
+
+    def _poll_agent_events(self):
+        if not os.path.exists(AGENT_EVENTS):
+            return
+        with open(AGENT_EVENTS, encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        if len(lines) <= self._agent_event_lines:
+            return
+        new = lines[self._agent_event_lines:]
+        self._agent_event_lines = len(lines)
+        for ln in new[-5:]:
+            try:
+                e = json.loads(ln)
+            except Exception:
+                continue
+            self.agent_last_var.set(f"{e.get('tool','?')}: {e.get('result','')[:40]}")
+            if e.get("approval") == "pending":
+                self.log(f"[AGENT] 等待人工批准: {e.get('result','')}")
+
+    def _poll_agent_approval(self):
+        if not os.path.exists(AGENT_APPROVAL):
+            self._agent_approval_id = None
+            return
+        try:
+            with open(AGENT_APPROVAL, encoding="utf-8") as f:
+                req = json.load(f)
+        except Exception:
+            return
+        rid = str(req.get("id", ""))
+        if rid == self._agent_approval_id:
+            return
+        self._agent_approval_id = rid
+        allow = messagebox.askyesno(
+            "Agent 请求人工确认",
+            "AI Agent 即将执行一个敏感操作：\n\n"
+            f"  工具: {req.get('tool','?')}\n"
+            f"  原因: {req.get('reason','?')}\n"
+            f"  时间: {req.get('ts','?')}\n\n"
+            "请先看投屏窗口确认当前画面。\n"
+            "点「是」允许，点「否」拒绝（Agent 会取消该操作）。")
+        try:
+            with open(AGENT_APPROVAL_RESULT, "w", encoding="utf-8") as f:
+                json.dump({"id": rid, "allow": bool(allow)}, f)
+        except Exception:
+            pass
+        self.log(f"[AGENT] 人工已{'允许' if allow else '拒绝'}敏感操作")
 
     # ---------- 投屏窗口即时控制 ----------
     def _set_screen_label(self):
@@ -1101,6 +1247,7 @@ class App(tk.Tk):
                 pass
             return
         self.log(f"      scrcpy PID={self.scrcpy_proc.pid} 运行中")
+        self._save_device_state(connected=True, bitrate=bitrate)
         self.screen_on = True
         self._set_screen_label()
         self._start_anchor()
@@ -1182,10 +1329,35 @@ class App(tk.Tk):
         self.scrcpy_proc = None
         self.screen_on = True
         self._set_screen_label()
+        self._save_device_state(connected=False)
         self.log("已断开投屏")
 
 
 if __name__ == "__main__":
+    # --agent-bridge: 以 MCP Server 模式运行（由主窗口「Agent 桥接」按钮拉起）
+    if "--agent-bridge" in sys.argv:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+            sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        try:
+            import agent_bridge
+            if "--http" in sys.argv:
+                i = sys.argv.index("--http")
+                port = sys.argv[i + 1] if len(sys.argv) > i + 1 else "8765"
+                agent_bridge.serve_http(port)
+            else:
+                agent_bridge.serve_stdio()
+        except Exception as e:
+            try:
+                with open(CRASH_LOG, "a", encoding="utf-8") as f:
+                    f.write("\n===== agent bridge crash =====\n%s\n" % e)
+            except Exception:
+                pass
+        sys.exit(0)
+
     # --overlay: 以贴图模式运行 (由主窗口「快捷键贴图」按钮拉起)
     if "--overlay" in sys.argv:
         try:

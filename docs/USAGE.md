@@ -134,4 +134,14 @@ Wi-Fi 信号差时会自动降码率保流畅，画面不会卡死。
  建议循环：截图/控件树 → 模型判断下一步 → 点击/输入 → 再截图，
  直到任务完成。中文输入建议改用剪贴板或 ADBKeyboard。
  小米必须开「USB调试（安全设置）」才能点锁屏/支付密码界面。
+
+ 【内置 MCP Bridge（v1.6）】
+ 点 GUI 的「Agent 桥接：开」，程序即以 MCP Server 模式运行，
+ 外部 Agent 客户端可用 "手机投屏助手.exe --agent-bridge" 作为 server 接入，
+ 提供 snapshot/screenshot/tap/swipe/click_by_selector/shell 等 15 个工具。
+
+ · 「暂停 Agent」按钮可随时冻结 Agent 操作，人直接接管投屏窗口
+ · 命中密码/验证码/支付等敏感界面会弹窗请求人工批准，点「是」才继续
+ · Agent 的每一步操作都会显示在 GUI 日志里，可随时查看
+ · 也可用 --agent-bridge --http 8765 起 HTTP 调试接口
 ```

@@ -15,6 +15,12 @@ tools/
 release/
 overlay_cmd.txt
 overlay_status.txt
+device_state.json
+agent_cmd.txt
+agent_events.jsonl
+agent_approval.json
+agent_approval_result.json
+agent_output/
 scrcpy_run.log
 scrcpy_run.err
 crash.log
