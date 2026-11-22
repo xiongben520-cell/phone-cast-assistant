@@ -1,0 +1,6 @@
+# 运行 / 打包所需依赖（Python 3.11）
+pyinstaller>=6.0
+opencv-python
+numpy
+qrcode
+Pillow

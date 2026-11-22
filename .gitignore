@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# 打包工具与运行时生成物（体积大 / 含上游二进制 / 本地状态）
+tools/
+release/
+overlay_cmd.txt
+overlay_status.txt
+scrcpy_run.log
+scrcpy_run.err
+crash.log
+*.log
+
+# 一次性调试脚本与输出
+*_test.py
+*_check.py
+bw_*.py
+perf_test.py
+make_overlay.py
+*_result.txt
+*_methods.txt
+_body_*.txt
+
+# 发行包（请通过 GitHub Releases 分发）
+*.zip
