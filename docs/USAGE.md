@@ -115,4 +115,23 @@ Wi-Fi 信号差时会自动降码率保流畅，画面不会卡死。
   Alt+W          自适应窗口大小、去掉黑边
   F11            投屏窗口全屏
   Alt+F4         关闭投屏
+
+================================================
+【给 AI Agent 用：让电脑上的 Agent 操作手机】
+ GUI 连好之后，Agent 可以复用同一条 adb 通道操作手机，
+ 人通过投屏窗口全程可见，随时能用鼠标接管。
+
+ 串号从 GUI「已发现设备」下拉框复制，adb 在 app\tools\adb.exe。
+ 常用命令（把 <serial> 换成实际串号）：
+
+   adb -s <serial> exec-out screencap -p > screen.png     （截图给视觉模型看）
+   adb -s <serial> shell uiautomator dump /sdcard/w.xml  （导出控件树，含文字+坐标）
+   adb -s <serial> shell input tap 720 1600              （点击）
+   adb -s <serial> shell input swipe 700 2200 700 900 300（滑动）
+   adb -s <serial> shell input text "hello"              （输入英文）
+   adb -s <serial> shell input keyevent 4                （返回键）
+
+ 建议循环：截图/控件树 → 模型判断下一步 → 点击/输入 → 再截图，
+ 直到任务完成。中文输入建议改用剪贴板或 ADBKeyboard。
+ 小米必须开「USB调试（安全设置）」才能点锁屏/支付密码界面。
 ```
