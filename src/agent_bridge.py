@@ -32,7 +32,7 @@ APPROVAL_RESULT = os.path.join(BASE, "agent_approval_result.json")
 OUT_DIR = os.path.join(BASE, "agent_output")
 CREATE_NO_WINDOW = 0x08000000
 SERVER_NAME = "phone-cast-assistant"
-SERVER_VER = "1.6.2"
+SERVER_VER = "1.6.3"
 
 # 只允许这些 adb shell 命令，杜绝 reboot / rm / pm uninstall / su 之类
 SHELL_WHITELIST = (

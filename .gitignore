@@ -27,6 +27,9 @@ scrcpy_run.err
 crash.log
 *.log
 
+# 本地备份文件（不应提交）
+*.bak-*
+
 # 一次性调试脚本与输出
 *_test.py
 *_check.py

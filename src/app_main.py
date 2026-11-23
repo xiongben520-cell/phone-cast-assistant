@@ -296,7 +296,9 @@ def pick_video_bitrate(serial, is_usb):
     target = bw * 0.8
     # 上下限: 太低没意义; 上限防止 USB3 之类超高带宽时算出离谱的码率
     # (1440p60 在 200Mbps 以上画质已接近无损, 再高只是浪费编码算力)
-    lo, hi = (20, 300) if is_usb else (2, 30)
+    # 无线上限从 30 降到 16：实测 30M 在 RSSI -63 / 高重传的 Wi-Fi 上容易抖动卡顿，
+    # 16M 可显著降低重传与编码压力，60fps 保持不变。
+    lo, hi = (20, 300) if is_usb else (2, 16)
     target = max(lo, min(hi, target))
     target = int(round(target))
     return target, "实测 %.0f Mbps, 取其 80%% = %d Mbps" % (bw, target)
@@ -1596,7 +1598,7 @@ class App(tk.Tk):
         # 触摸事件也会被系统丢弃, 导致"看得见却点不了"。改成亮屏 + --keep-active。
         argline = (f'-s "{serial}" --keep-active '
                    f'--audio-source=output --audio-buffer=200 --audio-output-buffer=50 '
-                   f'--max-fps=60 --video-bit-rate={bitrate}M')
+                   f'--max-fps=60 --video-bit-rate={bitrate}M --print-fps')
         logf = os.path.join(BASE, "scrcpy_run.log")
         errf = os.path.join(BASE, "scrcpy_run.err")
         try:
