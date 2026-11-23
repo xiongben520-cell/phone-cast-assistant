@@ -1,4 +1,4 @@
-# 手机投屏助手 —— Windows 打包脚本
+﻿# 手机投屏助手 —— Windows 打包脚本
 # 用法（在仓库根目录执行）:
 #   powershell -ExecutionPolicy Bypass -File scripts/build.ps1
 #

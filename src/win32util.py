@@ -84,13 +84,19 @@ def find_window(exe_name="scrcpy.exe"):
     """按进程名找第一个可见的顶层窗口, 找不到返回 0"""
     want = exe_name.lower()
     found = []
+    # 同一个进程会挂多个窗口, 按 pid 缓存进程名, 避免每个窗口都 OpenProcess 一次
+    names = {}
 
     def cb(hwnd, _):
         if not user32.IsWindowVisible(hwnd) or user32.GetWindowTextLengthW(hwnd) == 0:
             return True
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if proc_name(pid.value) == want:
+        name = names.get(pid.value)
+        if name is None:
+            name = proc_name(pid.value)
+            names[pid.value] = name
+        if name == want:
             found.append(hwnd)
             return False
         return True

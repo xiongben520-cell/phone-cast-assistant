@@ -16,6 +16,7 @@
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -24,7 +25,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
 APP_NAME = "手机投屏连接助手"
-APP_VER = "1.6"
+APP_VER = "1.6.2"
 
 
 # ============ 路径解析 (同时支持源码运行与 exe 运行) ============
@@ -49,6 +50,70 @@ AGENT_CMD = os.path.join(BASE, "agent_cmd.txt")
 AGENT_EVENTS = os.path.join(BASE, "agent_events.jsonl")
 AGENT_APPROVAL = os.path.join(BASE, "agent_approval.json")
 AGENT_APPROVAL_RESULT = os.path.join(BASE, "agent_approval_result.json")
+
+
+# ============ adb server 端口 ============
+# 背景: Windows 上 Hyper-V / WSL2 / Docker 会随机保留一段 TCP 端口范围。
+# 一旦 5037 落进保留段, adb server 绑定就会失败:
+#     could not install *smartsocket* listener: cannot bind to 127.0.0.1:5037
+#     (10013 拒绝访问) -> "could not read ok from ADB Server"
+# adb 客户端随后永远连不上 server, 表现为"刷新不到设备、无法连接"。
+# 这里启动时先探测 5037: 能连(已有 server)或能绑(空闲)就用默认端口,
+# 否则自动换一个动态端口范围之外的端口, 并通过 ANDROID_ADB_SERVER_PORT
+# 传给所有 adb / scrcpy 子进程(它们都读这个变量)。
+ADB_PORT_CANDIDATES = (5037, 15037, 25037, 35037, 45037, 50370)
+
+
+def _can_connect(port, host="127.0.0.1", timeout=0.5):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _can_bind(port, host="127.0.0.1"):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _looks_like_adb(port, timeout=6):
+    """端口上有服务在监听时, 确认它真的是 adb server(而不是随便一个本地服务)"""
+    try:
+        r = subprocess.run(
+            [ADB, "-P", str(port), "devices"],
+            capture_output=True, text=True, encoding="utf-8", errors="ignore",
+            timeout=timeout,
+            creationflags=(0x08000000 if os.name == "nt" else 0))
+        return "List of devices attached" in (r.stdout or "") + (r.stderr or "")
+    except Exception:
+        return False
+
+
+def pick_adb_port():
+    """返回 (端口, 原因)。用户显式设了环境变量就尊重用户的选择。"""
+    env = os.environ.get("ANDROID_ADB_SERVER_PORT", "").strip()
+    if env.isdigit():
+        return int(env), "环境变量 ANDROID_ADB_SERVER_PORT"
+
+    for port in ADB_PORT_CANDIDATES:
+        if _can_bind(port):
+            # 端口空闲: 可以直接用, adb 会自己起 server
+            return port, "默认端口可用" if port == 5037 else "5037 被系统保留，已自动避让"
+        if _can_connect(port) and _looks_like_adb(port):
+            # 已经有 adb server 在跑, 复用它, 避免起第二个 server
+            return port, "已有 adb server 在监听"
+    return 5037, "没有可用端口，退回默认（可能仍然失败）"
+
+
+ADB_PORT, ADB_PORT_WHY = pick_adb_port()
+os.environ["ANDROID_ADB_SERVER_PORT"] = str(ADB_PORT)
 
 try:
     import win32util
@@ -91,9 +156,30 @@ def run(cmd, timeout=40):
         return f"__ERR__ {e}"
 
 
-def adb_devices():
-    """返回 [ (serial, state) ]"""
-    out = run([ADB, "devices"])
+def adb_probe(timeout=12):
+    """探测设备列表, 同时判断 adb server 本身是否正常。
+
+    返回 ([(serial, state)], ok)。ok=False 表示 adb server 起不来
+    (端口被占/被系统保留/被杀软拦截), 此时设备列表没有参考价值。
+    """
+    out = run([ADB, "devices"], timeout=timeout)
+    bad = (out.startswith("__ERR__")
+           or "could not read ok from ADB Server" in out
+           or "failed to start daemon" in out
+           or "cannot connect to daemon" in out)
+    if bad:
+        # server 没起来或刚崩: 串行拉起一次再探测(内部有 30 秒失败冷却)
+        if not _can_connect(ADB_PORT):
+            _ADB_BOOT["ok"] = False
+            ensure_adb_server()
+            out = run([ADB, "devices"], timeout=timeout)
+            bad = (out.startswith("__ERR__")
+                   or "could not read ok from ADB Server" in out
+                   or "failed to start daemon" in out
+                   or "cannot connect to daemon" in out)
+    if bad:
+        return [], False
+
     res = []
     for line in out.splitlines()[1:]:
         if "\t" not in line:
@@ -101,11 +187,43 @@ def adb_devices():
         parts = line.split("\t")
         if len(parts) >= 2:
             res.append((parts[0].strip(), parts[1].strip()))
-    return res
+    return res, True
+
+
+def adb_devices():
+    """返回 [ (serial, state) ]"""
+    return adb_probe()[0]
 
 
 def adb(serial, *args, timeout=40):
     return run([ADB, "-s", serial] + list(args), timeout=timeout)
+
+
+# ---------- adb server 冷启动串行化 ----------
+# Windows 上 adb 冷启动时, 如果多个线程几乎同时发现 "daemon not running",
+# 会各自拉起一个 server 去抢同一个端口; 抢输的那个可能以 0xc0000409 崩溃。
+# 每次崩溃都会触发 Windows 错误报告(WER) + 杀软扫描, 表现就是整机"卡一下"。
+# 所以这里用一把锁把所有冷启动串起来, 失败后 30 秒内不反复重试。
+_ADB_BOOT = {"lock": threading.Lock(), "ts": 0.0, "ok": False, "tried": False}
+
+
+def ensure_adb_server(timeout=25):
+    """确保 adb server 已启动。返回 (ok, 输出)。"""
+    with _ADB_BOOT["lock"]:
+        if _ADB_BOOT["ok"]:
+            return True, ""
+        now = time.time()
+        if _ADB_BOOT["tried"] and now - _ADB_BOOT["ts"] < 30:
+            return False, "上一次启动失败, 30 秒内不重复尝试"
+        _ADB_BOOT["tried"] = True
+        _ADB_BOOT["ts"] = now
+        out = run([ADB, "start-server"], timeout=timeout)
+        bad = (out.startswith("__ERR__")
+               or "cannot connect to daemon" in out
+               or "failed to start daemon" in out
+               or "could not read ok from ADB Server" in out)
+        _ADB_BOOT["ok"] = not bad
+        return (not bad), out
 
 
 # ---------- 带宽实测 ----------
@@ -203,12 +321,22 @@ def is_usb_serial(serial):
     return True
 
 
-def usb_device_present():
+_PNP_CACHE = {"ts": 0.0, "value": (False, "")}
+
+
+def usb_device_present(max_age=15.0):
     """
     是否有小米/安卓手机接在 USB 上 (不管 adb 有没有授权)。
     用 Windows PnP 查 VID, 不依赖 adb。
+    结果缓存 max_age 秒: Get-PnpDevice 走 WMI, 一次要 1 秒左右,
+    以前每次刷新都跑, 容易造成整机一卡一卡。
+
     返回 (True/False, 描述文字)
     """
+    now = time.time()
+    if now - _PNP_CACHE["ts"] < max_age:
+        return _PNP_CACHE["value"]
+
     ps = (
         "$d = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
         "Where-Object { $_.InstanceId -match 'VID_2717|VID_18D1' }; "
@@ -218,13 +346,18 @@ def usb_device_present():
                "-Command", ps], timeout=25)
     lines = [ln.strip() for ln in out.splitlines() if "|" in ln]
     if not lines:
-        return False, ""
-    # 找到 ADB 接口的那条, 判断是否有驱动问题
-    has_adb_iface = any("ADB" in ln for ln in lines)
-    has_problem = any(ln.lower().startswith("error") or "problem" in ln.lower()
-                      for ln in lines)
-    return True, ("ADB接口已识别" if has_adb_iface else "设备已插入但ADB接口未识别") + \
-                 ("，驱动异常" if has_problem else "")
+        result = (False, "")
+    else:
+        # 找到 ADB 接口的那条, 判断是否有驱动问题
+        has_adb_iface = any("ADB" in ln for ln in lines)
+        has_problem = any(ln.lower().startswith("error") or "problem" in ln.lower()
+                          for ln in lines)
+        result = (True, ("ADB接口已识别" if has_adb_iface else "设备已插入但ADB接口未识别") +
+                  ("，驱动异常" if has_problem else ""))
+
+    _PNP_CACHE["ts"] = now
+    _PNP_CACHE["value"] = result
+    return result
 
 
 def usb_serial_from_sysfs():
@@ -270,8 +403,10 @@ class App(tk.Tk):
         self._anchor_thread = None
         self._anchor_stop = threading.Event()
         self.agent_proc = None
-        self._agent_event_lines = 0
+        self._agent_offset = 0
         self._agent_approval_id = None
+        self._last_ready = None
+        self._watchdog_stop = threading.Event()
 
         self._build_ui()
         self._check_env()
@@ -282,49 +417,74 @@ class App(tk.Tk):
     # ---------- 设备巡检 ----------
     def _start_watchdog(self):
         """
-        每 5 秒看一次 USB/无线设备状态:
+        后台线程每 5 秒看一次 USB/无线设备状态:
           * 已连接设备消失 (拔线 / 掉 wifi) -> 清空选中, scrcpy 已退出则提示
           * 之前没有设备, 现在插上了 -> 自动刷新
+
+        注意: 以前这个巡检跑在 Tk 主线程里, adb server 一旦异常,
+        `adb devices` 每次要等 2 秒超时, GUI 就每 5 秒卡 2 秒。
+        现在改为后台线程 + 主线程只负责刷 UI, 并且 adb 异常时自动退避。
         """
-        def tick():
-            try:
-                self._watchdog_tick()
-                self._refresh_ui_states()
-            except Exception:
-                pass
-            self.after(5000, tick)
-        self.after(6000, tick)
+        def loop():
+            interval = 5.0
+            while not self._watchdog_stop.is_set():
+                try:
+                    ready, ok = adb_probe()
+                    if ok:
+                        interval = 5.0
+                        self._watchdog_handle_devices(ready)
+                        states = self._read_ui_states()
+                        if states:
+                            self.after(0, lambda s=states: self._apply_ui_states(s))
+                    else:
+                        # adb server 起不来时别每 5 秒撞一次, 免得刷屏+耗 CPU
+                        interval = 20.0
+                except Exception:
+                    pass
+                self._watchdog_stop.wait(interval)
 
-    def _watchdog_tick(self):
-        try:
-            ready = [d[0] for d in adb_devices() if d[1] == "device"]
-        except Exception:
-            return
+        threading.Thread(target=loop, daemon=True).start()
 
-        prev = getattr(self, "_last_ready", None)
+    def _watchdog_handle_devices(self, ready):
+        """在后台线程算差异, 真正改 UI 的部分丢回主线程执行"""
+        prev = self._last_ready
         self._last_ready = ready
         if prev is None:
             return
 
+        msgs = []
+        refresh = False
+        clear_serial = False
+
         # 设备消失
         gone = [s for s in prev if s not in ready]
         if gone:
-            self.log(f"设备已断开: {', '.join(gone)}")
+            refresh = True
+            msgs.append(f"设备已断开: {', '.join(gone)}")
             if self.serial in gone:
-                self.serial = None
-                self.dev_var.set("")
+                clear_serial = True
                 kind = "数据线被拔出或USB调试被关闭" if is_usb_serial(gone[0]) \
                        else "无线调试断开或Wi-Fi切换"
-                self.log(f"   -> 可能是{kind}")
-                self.log("   -> 恢复后点「刷新」，或重新插一下数据线")
-            self.refresh_devices()
-            return
+                msgs.append(f"   -> 可能是{kind}")
+                msgs.append("   -> 恢复后点「刷新」，或重新插一下数据线")
+        else:
+            # 设备新出现
+            added = [s for s in ready if s not in prev]
+            if added:
+                refresh = True
+                names = ", ".join(("USB " if is_usb_serial(s) else "无线 ") + s
+                                  for s in added)
+                msgs.append(f"检测到新设备: {names}")
 
-        # 设备新出现
-        added = [s for s in ready if s not in prev]
-        if added:
-            names = ", ".join(("USB " if is_usb_serial(s) else "无线 ") + s for s in added)
-            self.log(f"检测到新设备: {names}")
+        if msgs or clear_serial:
+            def _apply(m=msgs, c=clear_serial):
+                for line in m:
+                    self.log(line)
+                if c:
+                    self.serial = None
+                    self.dev_var.set("")
+            self.after(0, _apply)
+        if refresh:
             self.refresh_devices()
 
     # ---------- 界面 ----------
@@ -423,6 +583,17 @@ class App(tk.Tk):
         ttk.Button(pr1b, text="开始配对", command=self.do_pair, width=12).pack(side="left")
         ttk.Label(pr1b, text="  手机: 无线调试 → 使用配对码配对设备").pack(side="left")
 
+        # 已配对过的手机: 直接填手机「无线调试」主页显示的 IP:端口, 秒连(绕开 mDNS)
+        pr1c = ttk.Frame(tab1)
+        pr1c.pack(fill="x", pady=(8, 0))
+        ttk.Label(pr1c, text="已配对？直接连:").pack(side="left")
+        self.direct_addr = tk.StringVar()
+        ttk.Entry(pr1c, textvariable=self.direct_addr, width=22).pack(side="left", padx=6)
+        ttk.Button(pr1c, text="直接连接", command=self.direct_connect,
+                   width=10).pack(side="left")
+        ttk.Label(pr1c, text="  填手机「无线调试」页里的 IP:端口",
+                  foreground="#888").pack(side="left")
+
         # ---- 方式二: 二维码 ----
         tab2 = ttk.Frame(nb, padding=8)
         nb.add(tab2, text="  二维码扫码  ")
@@ -447,6 +618,12 @@ class App(tk.Tk):
         self.qr_status = tk.StringVar(value="")
         ttk.Label(qr_right, textvariable=self.qr_status,
                   foreground="#0a7").pack(anchor="w", pady=(6, 0))
+
+        # 配对进度（两种方式共用；会实时显示"等待手机确认 N 秒"）
+        self.pair_status = tk.StringVar(value="")
+        self.pair_status_label = ttk.Label(pair, textvariable=self.pair_status,
+                                           foreground="#0a7")
+        self.pair_status_label.pack(anchor="w", pady=(8, 0))
 
         # 音量
         vol = ttk.LabelFrame(self, text=" 手机媒体音量 ", padding=10)
@@ -473,6 +650,13 @@ class App(tk.Tk):
         def _do():
             self.log_text.configure(state="normal")
             self.log_text.insert("end", time.strftime("[%H:%M:%S] ") + str(msg) + "\n")
+            # 长时间运行后日志会越来越长, ScrolledText 行数太多会拖慢 UI,
+            # 超过 3000 行就砍掉最早的 1000 行
+            try:
+                if int(self.log_text.index("end-1c").split(".")[0]) > 3000:
+                    self.log_text.delete("1.0", "1001.0")
+            except Exception:
+                pass
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
         try:
@@ -497,8 +681,19 @@ class App(tk.Tk):
                 "找不到 adb 或 scrcpy。\n\n请确保 tools 文件夹与程序在同一目录：\n"
                 f"{TOOLS}")
         else:
-            self.log(f"环境检查通过 (adb + scrcpy 就绪)")
+            ok, out = ensure_adb_server()
+            if ok:
+                self.log("环境检查通过 (adb + scrcpy 就绪)")
+            else:
+                self.log("!! adb server 启动失败")
+                tail = out.strip().splitlines()[-1] if out.strip() else ""
+                if tail:
+                    self.log("   " + tail)
             self.log(f"程序目录: {BASE}")
+            self.log(f"adb server 端口: {ADB_PORT}（{ADB_PORT_WHY}）")
+            if ADB_PORT != 5037:
+                self.log("   注意: 默认端口 5037 被系统保留(常见于 Hyper-V/WSL2),")
+                self.log("         已自动改用上面的端口; adb/scrcpy 子进程会继承该设置")
 
     # ---------- 设备 ----------
     def _on_mode_changed(self):
@@ -506,10 +701,14 @@ class App(tk.Tk):
         self.log(f"连接方式切换为: {label}")
         self.refresh_devices()
 
-    def _scan_usb_state(self):
-        """检查 USB 口上有没有手机 (不依赖 adb 授权状态)"""
-        present, desc = usb_device_present()
-        devs = adb_devices()
+    def _scan_usb_state(self, devs=None):
+        """检查 USB 口上有没有手机 (不依赖 adb 授权状态)
+
+        devs 已经由调用方探测过就直接复用, 避免一次刷新里 adb devices 跑两遍;
+        adb 已经明确报出 USB 设备时不再跑 PowerShell(Get-PnpDevice 走 WMI, 很慢)。
+        """
+        if devs is None:
+            devs = adb_devices()
         usb_ready = [d for d in devs if d[1] == "device" and is_usb_serial(d[0])]
         usb_unauth = [d for d in devs if d[1] != "device" and is_usb_serial(d[0])]
 
@@ -517,19 +716,32 @@ class App(tk.Tk):
             hint, color = f"有线: 已连接 ({usb_ready[0][0]})", "#0a7"
         elif usb_unauth:
             hint, color = "有线: 已插入，请在手机上点「允许USB调试」", "#c60"
-        elif present:
-            hint, color = f"有线: 已插入，{desc}（检查手机是否开了USB调试）", "#c60"
         else:
-            hint, color = "有线: 未检测到设备", "#888"
+            present, desc = usb_device_present()
+            if present:
+                hint, color = f"有线: 已插入，{desc}（检查手机是否开了USB调试）", "#c60"
+            else:
+                hint, color = "有线: 未检测到设备", "#888"
         return hint, color, usb_ready
 
     def refresh_devices(self):
         if not os.path.exists(ADB):
             return
         def work():
-            # 先探测 USB 状态 (给界面提示)
+            # 设备探测只做一次; adb server 异常时直接说明原因,
+            # 不要再白白跑 mDNS 自动连接和 PowerShell 查询
+            devs, adb_ok = adb_probe()
+            if not adb_ok:
+                self.log(f"adb server 无法连接（当前端口 {ADB_PORT}）")
+                self.log("   -> 可能是端口被系统保留/安全软件拦截")
+                self.log("   -> 修复见「使用说明.md → adb 连不上」一节")
+                self.after(0, lambda: (self.usb_hint.set("有线: adb 未就绪"),
+                                       self.usb_hint_label.configure(foreground="#c00")))
+                return
+
+            # USB 状态提示
             try:
-                hint, color, usb_ready = self._scan_usb_state()
+                hint, color, usb_ready = self._scan_usb_state(devs)
             except Exception:
                 hint, color, usb_ready = "有线: 检测失败", "#888", []
 
@@ -541,7 +753,6 @@ class App(tk.Tk):
                     pass
             self.after(0, _apply_hint)
 
-            devs = adb_devices()
             ready = [d for d in devs if d[1] == "device"]
 
             # 列表为空但 mDNS 能看到服务 -> 自动 connect (配对后常见)
@@ -701,15 +912,34 @@ class App(tk.Tk):
         self.after(1200, tick)
 
     def _poll_agent_events(self):
+        """增量读取审计日志, 不再每秒把整个 jsonl 读一遍
+
+        Agent 长时间运行后 agent_events.jsonl 会越写越大, 原来每秒
+        readlines() 整文件, 文件一大就会明显拖慢界面。
+        """
         if not os.path.exists(AGENT_EVENTS):
             return
-        with open(AGENT_EVENTS, encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-        if len(lines) <= self._agent_event_lines:
+        try:
+            size = os.path.getsize(AGENT_EVENTS)
+        except OSError:
             return
-        new = lines[self._agent_event_lines:]
-        self._agent_event_lines = len(lines)
-        for ln in new[-5:]:
+        if size < self._agent_offset:      # 文件被清空/轮转
+            self._agent_offset = 0
+        if size == self._agent_offset:
+            return
+        try:
+            with open(AGENT_EVENTS, "rb") as f:
+                f.seek(self._agent_offset)
+                chunk = f.read()
+        except OSError:
+            return
+
+        cut = chunk.rfind(b"\n")           # 只处理完整行, 半行留到下次
+        if cut < 0:
+            return
+        self._agent_offset += cut + 1
+        lines = chunk[:cut].decode("utf-8", "ignore").splitlines()[-5:]
+        for ln in lines:
             try:
                 e = json.loads(ln)
             except Exception:
@@ -795,23 +1025,37 @@ class App(tk.Tk):
         except Exception as e:
             print("write overlay cmd failed:", e)
 
-    def _refresh_ui_states(self):
-        """从窗口/贴图状态文件回读，让按钮文字和实际状态一致"""
+    def _read_ui_states(self):
+        """后台线程里读窗口/贴图状态, 只返回需要改的文案
+
+        以前每 5 秒在主线程跑一次 find_window()(EnumWindows + 每个窗口
+        OpenProcess/QueryFullProcessImageName), 窗口一多就是一次小卡顿。
+        现在放到后台线程, 且投屏没在跑时直接跳过窗口枚举。
+        """
+        states = {}
         try:
-            if win32util:
+            if win32util and self.scrcpy_proc and self.scrcpy_proc.poll() is None:
                 hwnd = win32util.find_window()
                 if hwnd:
-                    on = win32util.is_topmost(hwnd)
-                    self.topmost_var.set("投屏置顶：开" if on else "投屏置顶：关")
+                    states["topmost"] = ("投屏置顶：开" if win32util.is_topmost(hwnd)
+                                         else "投屏置顶：关")
             if os.path.exists(OVERLAY_STATUS):
                 with open(OVERLAY_STATUS, encoding="utf-8", errors="ignore") as f:
                     line = f.readline()
                 m = re.search(r"follow=(True|False)", line)
                 if m:
-                    on = m.group(1) == "True"
-                    self.follow_var.set("贴图跟随：开" if on else "贴图跟随：关")
+                    states["follow"] = ("贴图跟随：开" if m.group(1) == "True"
+                                        else "贴图跟随：关")
         except Exception:
             pass
+        return states
+
+    def _apply_ui_states(self, states):
+        """在主线程里落状态"""
+        if "topmost" in states:
+            self.topmost_var.set(states["topmost"])
+        if "follow" in states:
+            self.follow_var.set(states["follow"])
 
     # ---------- 旋转锚点 ----------
     def _start_anchor(self):
@@ -1034,6 +1278,7 @@ class App(tk.Tk):
 
         # 等 adb 自己完成配对
         self.log("等待手机扫码 ...")
+        self._set_pair_status("等待手机扫码…（扫到后手机会弹确认，请点允许）", "#c60")
         try:
             proc.wait(timeout=180)
         except subprocess.TimeoutExpired:
@@ -1059,19 +1304,10 @@ class App(tk.Tk):
         self.log("扫码配对成功 —— 正在建立连接 ...")
         self.qr_status.set("配对成功")
         self.after(0, lambda: self.qr_label.configure(image="", text="配对成功 ✓"))
+        self._set_pair_status("扫码配对成功，正在连接…（手机若弹「允许无线调试」请点允许）", "#c60")
         # 二维码凭据里没有手机 IP, 直接从 mDNS 广播里找连接端口
-        connected = self._auto_connect_by_mdns()
-        if connected:
-            self.log(f"连接成功: {connected}")
-            self.after(0, lambda: messagebox.showinfo(
-                "配对并连接成功", "手机已配对并连接，现在可以点「连接并投屏」"))
-        else:
-            self.log("配对成功但自动连接失败, 请点「刷新」")
-            self.after(0, lambda: messagebox.showwarning(
-                "需要手动连接",
-                "配对已成功，但没能自动连上。\n\n"
-                "请回到手机「无线调试」主页面查看显示的 IP 地址和端口，然后点「刷新」。"))
-        self.refresh_devices()
+        connected = self._auto_connect_any()
+        self._finish_pair(connected)
 
     def stop_qr_pair(self):
         if self.qr_proc and self.qr_proc.poll() is None:
@@ -1085,12 +1321,120 @@ class App(tk.Tk):
         self.qr_status.set("已取消")
         self.qr_label.configure(image="", text="点「生成二维码」后显示", width=32, height=10)
 
+    # ---------- 配对进度 / 直接连接 ----------
+    def _set_pair_status(self, text, color="#0a7"):
+        """后台线程更新配对状态（走主线程，避免 Tk 跨线程抖动）"""
+        def _do():
+            try:
+                self.pair_status.set(text)
+                self.pair_status_label.configure(foreground=color)
+            except Exception:
+                pass
+        try:
+            self.after(0, _do)
+        except Exception:
+            pass
+
+    def direct_connect(self):
+        """跳过 mDNS, 直接连手机「无线调试」页显示的 IP:端口"""
+        addr = self.direct_addr.get().strip()
+        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$", addr):
+            messagebox.showwarning(
+                "格式不对",
+                "请填手机「无线调试」主页面显示的 IP:端口，\n例如 192.168.1.8:37105")
+            return
+
+        def work():
+            self.log(f"直接连接 {addr} ...")
+            self._set_pair_status(f"正在连接 {addr} …", "#c60")
+            out = run([ADB, "connect", addr], timeout=20)
+            self.log(out.strip())
+            devs, _ = adb_probe(timeout=8)
+            if any(s == addr and st == "device" for s, st in devs):
+                self.log(f"连接成功: {addr}")
+                self._set_pair_status(f"已连接: {addr}", "#0a7")
+                self.refresh_devices()
+                self.after(0, lambda: messagebox.showinfo(
+                    "连接成功", "已连上，现在可以点「连接并投屏」"))
+            else:
+                self.log("连接失败: 确认手机和电脑在同一 Wi-Fi，且手机的无线调试页面开着")
+                self._set_pair_status("连接失败：检查同一 Wi-Fi / 无线调试是否开着", "#c00")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_pair(self, connected):
+        """配对后统一收尾: 成功提示 / 失败时的引导"""
+        if connected:
+            self.log(f"连接成功: {connected}")
+            self._set_pair_status(f"已连接: {connected}", "#0a7")
+            self.refresh_devices()
+            self.after(0, lambda: messagebox.showinfo(
+                "配对并连接成功", "手机已配对并连接，现在可以点「连接并投屏」"))
+            return
+
+        self.log("自动连接没成功（多数是 mDNS 广播还没出来，通常要等 30-60 秒）")
+        self.log("   最快办法: 看手机「无线调试」主页面的 IP:端口，")
+        self.log("             填到「已配对？直接连」→ 点「直接连接」")
+        self._set_pair_status("配对成功，但自动连接未建立：请填手机上的 IP:端口 直接连接", "#c60")
+        self.refresh_devices()
+        self.after(0, lambda: messagebox.showwarning(
+            "还差最后一步：连接",
+            "配对已经成功了。\n\n"
+            "无线调试的连接端口要靠 mDNS 广播，有时要等 1 分钟左右才出现。\n\n"
+            "最快的办法：\n"
+            "1. 看手机「无线调试」主页面显示的 IP:端口\n"
+            "   （例：192.168.1.8:37105）\n"
+            "2. 填到程序里的「已配对？直接连」，点「直接连接」\n\n"
+            "或者等 30 秒后点「刷新」。"))
+
     def _pair_worker(self, addr, code):
         self.log(f"正在配对 {addr} ...")
-        out = run([ADB, "pair", addr, code], timeout=40)
-        self.log(out.strip())
+        self.log("   ⚠ 请立刻看手机：会弹出「允许配对 / 允许无线调试」，点允许")
+        self._set_pair_status("等待手机确认：请点手机上的「允许配对」（最多等 90 秒）", "#c60")
+
+        start = time.time()
+        try:
+            proc = subprocess.Popen(
+                [ADB, "pair", addr, code],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW)
+        except Exception as e:
+            self.log(f"adb pair 启动失败: {e}")
+            self._set_pair_status("配对失败：adb 启动失败", "#c00")
+            return
+
+        chunks = []
+        reader = threading.Thread(
+            target=lambda: chunks.append(proc.stdout.read()), daemon=True)
+        reader.start()
+
+        # adb pair 会挂起等手机确认; 这段时间要一直告诉用户在等什么、还剩多久
+        deadline = start + 90
+        while proc.poll() is None and time.time() < deadline:
+            el = int(time.time() - start)
+            remain = max(0, int(deadline - time.time()))
+            self._set_pair_status(
+                f"等待手机确认… 已等 {el}s（剩 {remain}s）：请在手机上点「允许配对」", "#c60")
+            time.sleep(2)
+
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            self.log("配对超时：手机上一直没有点「允许配对」")
+            self.log("   -> 请重新在手机上点「使用配对码配对设备」，")
+            self.log("      把【最新】显示的 IP:端口 和 配对码填进来")
+            self._set_pair_status("配对超时：请重新生成配对码再试", "#c00")
+            return
+
+        reader.join(2)
+        out = b"".join(chunks).decode("utf-8", "replace")
+        out = re.sub(r"\x1b\[[0-9;]*m", "", out)
+        self.log(out.strip()[-400:])
 
         if "Successfully paired" not in out:
+            self._set_pair_status("配对失败：端口/配对码可能已过期，请重新生成", "#c00")
             if "protocol fault" in out:
                 self.log("配对失败：这个端口已经失效或配对码过期")
                 self.log("   -> 请重新在手机上点「使用配对码配对设备」，")
@@ -1099,51 +1443,33 @@ class App(tk.Tk):
                 self.log("配对失败，请确认配对码和地址是否最新（配对码每次打开都不同）")
             return
 
-        self.log("配对成功 —— 正在建立连接 ...")
-
         # 关键: adb pair 只交换密钥, 不会建立连接, 必须再 connect 一次
         ip = addr.split(":")[0]
+        if not self.direct_addr.get().strip():
+            self.direct_addr.set(f"{ip}:")   # 方便 mDNS 慢时手动补端口
+        self.log("配对成功 —— 开始连接（mDNS 广播可能要等一会，最多 90 秒）")
+        self.log("   ⚠ 若手机弹出「允许无线调试」，请点允许")
+        self._set_pair_status("配对成功，正在连接…（手机若弹「允许无线调试」请点允许）", "#c60")
+
         connected = self._auto_connect(ip)
+        self._finish_pair(connected)
 
-        if connected:
-            self.log(f"连接成功: {connected}")
-            self.after(0, lambda: messagebox.showinfo(
-                "配对并连接成功", "手机已连接，现在可以点「连接并投屏」"))
-        else:
-            self.log("配对成功但自动连接失败")
-            self.log("   -> 请点「刷新」, 或手动在手机「无线调试」主页面查看 IP:端口")
-            self.after(0, lambda: messagebox.showwarning(
-                "需要手动连接",
-                "配对已成功，但没能自动连上。\n\n"
-                "请回到手机「无线调试」主页面（不是配对弹窗），\n"
-                "查看那里显示的 IP 地址和端口，然后点「刷新」。"))
-        self.refresh_devices()
+    def _auto_connect(self, ip, total=90):
+        """配对后自动找连接端口并 connect, 返回成功的串号或 None
 
-    def _auto_connect_by_mdns(self):
-        """不指定 IP, 直接从 mDNS 广播里找 _adb-tls-connect 端口并连接"""
-        for _ in range(5):
-            out = run([ADB, "mdns", "services"], timeout=20)
-            targets = []
-            for line in out.splitlines():
-                if "_adb-tls-connect._tcp" in line:
-                    m = re.search(r"(\d+\.\d+\.\d+\.\d+:\d+)\s*$", line.strip())
-                    if m:
-                        targets.append(m.group(1))
-            for tgt in targets:
-                r = run([ADB, "connect", tgt], timeout=25)
-                if "connected to" in r:
-                    time.sleep(1.5)
-                    for ln in run([ADB, "devices"]).splitlines()[1:]:
-                        if tgt in ln and "\tdevice" in ln:
-                            return tgt
-            time.sleep(2)
-        return None
+        优化: adb mdns services 超时 20s -> 8s; 每轮先看 adb devices(便宜)
+        再查 mDNS; 全程最多 total 秒, 状态实时更新, 不再一声不吭卡一分钟。
+        """
+        start = time.time()
+        deadline = start + total
+        tried_legacy = False
+        while time.time() < deadline:
+            devs, _ = adb_probe(timeout=8)
+            for s, st in devs:
+                if s.startswith(ip + ":") and st == "device":
+                    return s
 
-    def _auto_connect(self, ip):
-        """配对后自动找连接端口并 connect, 返回成功的串号或 None"""
-        # 1. 先用 mDNS 发现的连接服务 (配对服务端口与连接端口不同)
-        for attempt in range(4):
-            out = run([ADB, "mdns", "services"], timeout=20)
+            out = run([ADB, "mdns", "services"], timeout=8)
             ports = set()
             for line in out.splitlines():
                 if "_adb-tls-connect._tcp" in line and ip in line:
@@ -1152,25 +1478,73 @@ class App(tk.Tk):
                         ports.add(m.group(1))
             for port in ports:
                 tgt = f"{ip}:{port}"
-                r = run([ADB, "connect", tgt], timeout=25)
-                if "connected to" in r:
-                    # 确认真的在线 device 状态
-                    time.sleep(1.5)
-                    for line in run([ADB, "devices"]).splitlines()[1:]:
-                        if tgt in line and "\tdevice" in line:
-                            self.log(f"   mDNS 连接成功: {tgt}")
-                            return tgt
-            time.sleep(2)
+                r = run([ADB, "connect", tgt], timeout=15)
+                if "connected to" in r or "already connected" in r:
+                    time.sleep(0.8)
+                    devs, _ = adb_probe(timeout=8)
+                    if any(s == tgt and st == "device" for s, st in devs):
+                        return tgt
 
-        # 2. mDNS 拿不到就用 adb devices 里出现的任何本机设备
-        for line in run([ADB, "devices"]).splitlines()[1:]:
-            if ip in line and "\tdevice" in line:
-                return line.split("\t")[0].strip()
+            if not tried_legacy:
+                # 老式 adb tcpip 5555 也试一次, 有就赚到
+                tried_legacy = True
+                run([ADB, "connect", f"{ip}:5555"], timeout=10)
+
+            el = int(time.time() - start)
+            self._set_pair_status(
+                f"正在连接… 已等 {el}s / 最多 {total}s（手机若弹「允许无线调试」请点允许）", "#c60")
+            time.sleep(2)
         return None
+
+    def _auto_connect_any(self, total=120):
+        """扫码配对后不知道手机 IP, 从 mDNS 广播里找任意 _adb-tls-connect 并连接"""
+        start = time.time()
+        deadline = start + total
+        while time.time() < deadline:
+            devs, _ = adb_probe(timeout=8)
+            for s, st in devs:
+                if ":" in s and st == "device":
+                    return s
+
+            out = run([ADB, "mdns", "services"], timeout=8)
+            for line in out.splitlines():
+                if "_adb-tls-connect._tcp" not in line:
+                    continue
+                m = re.search(r"(\d+\.\d+\.\d+\.\d+:\d+)\s*$", line.strip())
+                if not m:
+                    continue
+                tgt = m.group(1)
+                r = run([ADB, "connect", tgt], timeout=15)
+                if "connected to" in r or "already connected" in r:
+                    time.sleep(0.8)
+                    devs, _ = adb_probe(timeout=8)
+                    if any(s == tgt and st == "device" for s, st in devs):
+                        return tgt
+
+            el = int(time.time() - start)
+            self._set_pair_status(
+                f"扫码成功，正在连接… 已等 {el}s / 最多 {total}s", "#c60")
+            time.sleep(2)
+        return None
+
+    def _auto_connect_by_mdns(self):
+        """兼容旧调用: 不指定 IP 的连接"""
+        return self._auto_connect_any()
 
     # ---------- 连接 ----------
     def connect(self):
         if not self.serial:
+            # adb server 本身没起来时, 先别把锅甩给手机
+            _, adb_ok = adb_probe()
+            if not adb_ok:
+                messagebox.showerror(
+                    "adb 未就绪",
+                    f"adb server 起不来（当前端口 {ADB_PORT}）。\n\n"
+                    "常见原因：Windows 把该端口保留给了 Hyper-V / WSL2，\n"
+                    "或安全软件拦截了 adb。\n\n"
+                    "程序已尝试自动换端口；若仍失败，请重启本程序，\n"
+                    "或查看「使用说明.md → adb 连不上」一节。")
+                return
             # 分情况给提示, 别让用户干瞪眼
             present, desc = usb_device_present()
             if self.link_mode.get() in ("auto", "usb") and present:

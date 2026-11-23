@@ -45,13 +45,18 @@ def proc_name(pid):
 
 def find_scrcpy():
     res = []
+    names = {}          # 同一进程多个窗口只查一次进程名
 
     def cb(hwnd, lp):
         if not user32.IsWindowVisible(hwnd) or user32.GetWindowTextLengthW(hwnd) == 0:
             return True
         p = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
-        if proc_name(p.value).lower() == TARGET_EXE:
+        name = names.get(p.value)
+        if name is None:
+            name = proc_name(p.value)
+            names[p.value] = name
+        if name.lower() == TARGET_EXE:
             r = wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(r))
             res.append({"hwnd": hwnd, "left": r.left, "top": r.top,
