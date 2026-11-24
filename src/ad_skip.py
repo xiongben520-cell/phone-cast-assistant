@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -85,7 +86,12 @@ class AdSkipWatcher:
         self.base = base
         self.log_cb = log_cb or (lambda s: None)
         self.status_cb = status_cb or (lambda s: None)
-        self.ocr_ps = os.path.join(base, "ocr_helper.ps1")
+        # PyInstaller 6 onedir 把 --add-data 的文件放进 _internal/（sys._MEIPASS），
+        # 而 exe 根目录是 base。两处都找，兼容打包版与源码运行。
+        meipass = getattr(sys, "_MEIPASS", "") or ""
+        bundled = os.path.join(meipass, "ocr_helper.ps1") if meipass else ""
+        self.ocr_ps = bundled if bundled and os.path.exists(bundled) \
+            else os.path.join(base, "ocr_helper.ps1")
         self.tmp_dir = os.path.join(base, "adskip_tmp")
         self.log_file = os.path.join(base, "ad_skip.log")
         self._stop = threading.Event()

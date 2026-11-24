@@ -41,6 +41,7 @@ try {
     New-Item -ItemType Directory -Force -Path $app | Out-Null
     Copy-Item "dist\手机投屏助手\*" $app -Recurse -Force
     Copy-Item "tools" (Join-Path $app "tools") -Recurse -Force
+    Copy-Item "src\ocr_helper.ps1" (Join-Path $app "ocr_helper.ps1") -Force
     Copy-Item "docs\USAGE.md" "release\手机投屏助手\使用说明.md" -Force
 
     Write-Host "构建完成: $Root\release\手机投屏助手"
