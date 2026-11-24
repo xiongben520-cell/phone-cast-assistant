@@ -24,8 +24,13 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
+try:
+    import ad_skip
+except Exception:  # 缺模块时不让整个 GUI 起不来
+    ad_skip = None
+
 APP_NAME = "手机投屏连接助手"
-APP_VER = "1.6.2"
+APP_VER = "1.6.3"
 
 
 # ============ 路径解析 (同时支持源码运行与 exe 运行) ============
@@ -409,6 +414,8 @@ class App(tk.Tk):
         self._agent_approval_id = None
         self._last_ready = None
         self._watchdog_stop = threading.Event()
+        self.ad_skip_watcher = None
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
         self._check_env()
@@ -556,6 +563,16 @@ class App(tk.Tk):
                    command=self.toggle_agent_pause, width=12).pack(side="left", padx=6)
         self.agent_last_var = tk.StringVar(value="Agent 空闲")
         ttk.Label(row4, textvariable=self.agent_last_var, foreground="#666").pack(side="left")
+
+        # 第四排: 红果短剧广告自动跳过
+        row5 = ttk.Frame(top)
+        row5.pack(fill="x", pady=(6, 0))
+        self.adskip_var = tk.StringVar(value="跳广告：关")
+        ttk.Button(row5, textvariable=self.adskip_var, command=self.toggle_ad_skip,
+                   width=14).pack(side="left")
+        self.adskip_status_var = tk.StringVar(value="跳广告：空闲")
+        ttk.Label(row5, textvariable=self.adskip_status_var,
+                  foreground="#666").pack(side="left", padx=8)
 
         # 配对 (两种方式: 手动填写 / 二维码扫码)
         pair = ttk.LabelFrame(self, text=" 首次配对 (新手机需要一次) ", padding=10)
@@ -890,6 +907,41 @@ class App(tk.Tk):
                 f.write(cmd)
         except Exception:
             pass
+
+    # ---------- 红果短剧广告自动跳过 ----------
+    def toggle_ad_skip(self):
+        """开/关「检测到广告自动上滑」，后台线程运行，不阻塞 GUI"""
+        if self.ad_skip_watcher and self.ad_skip_watcher.is_running():
+            self.ad_skip_watcher.stop()
+            self.ad_skip_watcher = None
+            self.adskip_var.set("跳广告：关")
+            return
+        if ad_skip is None:
+            self.log("[跳广告] 模块缺失：请确认 ad_skip.py 已随程序打包")
+            messagebox.showerror("跳广告", "缺少 ad_skip.py 模块，无法启用")
+            return
+        self.ad_skip_watcher = ad_skip.AdSkipWatcher(
+            ADB, BASE, self.log, self._on_ad_skip_status)
+        if self.ad_skip_watcher.start():
+            self.adskip_var.set("跳广告：开")
+        else:
+            self.ad_skip_watcher = None
+
+    def _on_ad_skip_status(self, text):
+        def _apply():
+            self.adskip_status_var.set("跳广告：" + text)
+        try:
+            self.after(0, _apply)
+        except Exception:
+            pass
+
+    def _on_close(self):
+        try:
+            if self.ad_skip_watcher and self.ad_skip_watcher.is_running():
+                self.ad_skip_watcher.stop()
+        except Exception:
+            pass
+        self.destroy()
 
     def _save_device_state(self, connected=True, bitrate=None):
         """把当前连接信息写给 Agent Bridge，让它复用同一条 adb 通道"""

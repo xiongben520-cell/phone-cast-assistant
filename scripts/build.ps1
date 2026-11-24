@@ -26,7 +26,8 @@ try {
     & $py -m PyInstaller --noconfirm --onedir --noconsole `
         --name "手机投屏助手" --specpath . `
         --add-data "src\overlay_main.py;." `
-        --hidden-import win32util --hidden-import qr_locator --hidden-import agent_bridge `
+        --add-data "src\ocr_helper.ps1;." `
+        --hidden-import win32util --hidden-import qr_locator --hidden-import agent_bridge --hidden-import ad_skip `
         --collect-all qrcode `
         --hidden-import cv2 --hidden-import numpy `
         --hidden-import PIL.ImageTk --hidden-import PIL._tkinter_finder `
