@@ -30,7 +30,7 @@ except Exception:  # 缺模块时不让整个 GUI 起不来
     ad_skip = None
 
 APP_NAME = "手机投屏连接助手"
-APP_VER = "1.6.3"
+APP_VER = "1.6.4"
 
 
 # ============ 路径解析 (同时支持源码运行与 exe 运行) ============
@@ -202,6 +202,43 @@ def adb_devices():
 
 def adb(serial, *args, timeout=40):
     return run([ADB, "-s", serial] + list(args), timeout=timeout)
+
+
+def get_media_volume(serial):
+    """读手机媒体音量 (STREAM_MUSIC)，失败返回 None。
+    cmd media_session volume --set 实测不生效，只能用 keyevent 调。"""
+    out = adb(serial, "shell", "cmd media_session volume --stream 3 --get", timeout=15)
+    m = re.search(r"volume is (\d+)(?:\s+in range \[0\.\.(\d+)\])?", out)
+    return int(m.group(1)) if m else None
+
+
+def set_media_volume(serial, target, max_press=40):
+    """用 VOLUME_UP/DOWN 调到目标音量，返回最终值。
+    实测小米 150 量程步进 5~10，所以最终以读数为判据。
+    先按估算步数批量按键（快），再逐格补（稳）。"""
+    target = max(0, int(target))
+    cur = get_media_volume(serial)
+    if cur is None or cur == target:
+        return cur
+    key = 25 if cur > target else 24   # 25=VOLUME_DOWN, 24=VOLUME_UP
+    n = min(max_press, abs(cur - target) // 5 + 3)
+    for _ in range(n):
+        adb(serial, "shell", "input keyevent %d" % key, timeout=5)
+    final = get_media_volume(serial)
+    for _ in range(max_press):
+        if final is None or final == target:
+            break
+        adb(serial, "shell", "input keyevent %d" % (25 if final > target else 24),
+            timeout=5)
+        final = get_media_volume(serial)
+    return final
+
+
+def pause_phone_playback(serial):
+    """暂停手机上的媒体播放。红果有 active media button session，
+    KEYCODE_MEDIA_PAUSE(127) 实测可暂停；再补一条 media_session dispatch 兜底。"""
+    adb(serial, "shell", "input keyevent 127", timeout=10)
+    adb(serial, "shell", "cmd media_session dispatch pause", timeout=10)
 
 
 # ---------- adb server 冷启动串行化 ----------
@@ -414,6 +451,10 @@ class App(tk.Tk):
         self._agent_approval_id = None
         self._last_ready = None
         self._watchdog_stop = threading.Event()
+        # 投屏断开收尾：记住本次连接时的音量，断开时暂停播放并归零，防止声音外泄
+        self._cast_volume_before = 0
+        self._last_cast_serial = None
+        self._release_lock = threading.Lock()
         self.ad_skip_watcher = None
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -441,6 +482,13 @@ class App(tk.Tk):
                     ready, ok = adb_probe()
                     if ok:
                         interval = 5.0
+                        # scrcpy 自己崩掉/被杀时也算断开，必须暂停播放并静音
+                        if (self.scrcpy_proc is not None
+                                and self.scrcpy_proc.poll() is not None):
+                            self._release_cast("scrcpy 意外退出")
+                            self.scrcpy_proc = None
+                            self.after(0, lambda: self.log(
+                                "scrcpy 已退出，手机播放已暂停并静音"))
                         self._watchdog_handle_devices(ready)
                         states = self._read_ui_states()
                         if states:
@@ -472,6 +520,7 @@ class App(tk.Tk):
             msgs.append(f"设备已断开: {', '.join(gone)}")
             if self.serial in gone:
                 clear_serial = True
+                self._release_cast("设备断开")
                 kind = "数据线被拔出或USB调试被关闭" if is_usb_serial(gone[0]) \
                        else "无线调试断开或Wi-Fi切换"
                 msgs.append(f"   -> 可能是{kind}")
@@ -939,6 +988,12 @@ class App(tk.Tk):
         try:
             if self.ad_skip_watcher and self.ad_skip_watcher.is_running():
                 self.ad_skip_watcher.stop()
+        except Exception:
+            pass
+        try:
+            # 关窗口也是断开：暂停播放 + 静音，并收掉 scrcpy 孤儿进程
+            self._release_cast("关闭程序")
+            run(["taskkill", "/F", "/IM", "scrcpy.exe", "/T"], timeout=15)
         except Exception:
             pass
         self.destroy()
@@ -1642,6 +1697,16 @@ class App(tk.Tk):
         self.log(f"     {why}")
         self.log(f"     目标: 60fps / {bitrate} Mbps")
 
+        # 2.5 媒体音量：上次断开时为防外泄归零了，连接时恢复（scrcpy 抓音需要非零音量）
+        orig_vol = get_media_volume(serial)
+        self._cast_volume_before = orig_vol if orig_vol and orig_vol > 0 else TARGET_VOLUME
+        self._last_cast_serial = serial
+        if orig_vol is None or orig_vol <= 0:
+            back = set_media_volume(serial, self._cast_volume_before)
+            self.log(f"     媒体音量已从 0 恢复到 {back}（scrcpy 抓音需要非零音量）")
+        else:
+            self.log(f"     媒体音量 {orig_vol}（投屏期间保持不变）")
+
         # 3. scrcpy
         self.log("[3/4] 启动 scrcpy ...")
         run(["taskkill", "/F", "/IM", "scrcpy.exe", "/T"])
@@ -1750,8 +1815,28 @@ class App(tk.Tk):
         except Exception as e:
             self.log(f"贴图启动失败: {e}")
 
+    # ---------- 断开收尾：暂停播放 + 防外泄 ----------
+    def _release_cast(self, reason):
+        """投屏断开统一收尾：暂停手机播放并把媒体音量归零，
+        避免 scrcpy 退出后音频路由回到扬声器、手机继续外放。
+        主线程与 watchdog 后台线程都可能调用，内部加锁防重复。"""
+        with self._release_lock:
+            serial = self._last_cast_serial or self.serial
+            if serial:
+                try:
+                    pause_phone_playback(serial)
+                    final = set_media_volume(serial, 0)
+                    self.log(f"[{reason}] 已暂停手机播放，媒体音量归零（当前 {final}）")
+                except Exception as e:
+                    self.log(f"[{reason}] 暂停/静音失败: {e}")
+            else:
+                self.log(f"[{reason}] 无设备串号，跳过暂停/静音")
+            self._last_cast_serial = None
+            self._cast_volume_before = 0
+
     # ---------- 断开 ----------
     def disconnect_all(self):
+        self._release_cast("手动断开")
         run(["taskkill", "/F", "/IM", "scrcpy.exe", "/T"])
         self._anchor_stop.set()
         self.scrcpy_proc = None
