@@ -1,5 +1,13 @@
 # 更新日志
 
+## v1.6.7 (2026-11-25)
+
+- **修复「手机音量键 / Alt+↑↓ 调音量，PC 音量合成器里投屏窗口音量没变化」**：
+  - 根因：音量同步跑在子线程，而 pycaw/comtypes 依赖 COM，**子线程未 CoInitialize 时 `GetAllSessions()` 返回空、设置失败**（主线程正常）。所以同步线程实际从没成功设置过 scrcpy 会话音量。
+  - 修复：`pc_volume.init_com()` 在同步线程启动时调用 `CoInitialize`，之后子线程就能按 PID 找到 scrcpy 会话并设置音量。
+  - 验证：子线程未初始化 COM 时 get 返回 None/set=False；初始化后 set=True 且音量正确变化。
+- 版本号升为 1.6.7。
+
 ## v1.6.6 (2026-11-25)
 
 - **手机音量键控制「投屏窗口」音量**（不控制 Windows 系统主音量）：

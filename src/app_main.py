@@ -35,7 +35,7 @@ except Exception:
     pc_volume = None
 
 APP_NAME = "手机投屏连接助手"
-APP_VER = "1.6.6"
+APP_VER = "1.6.7"
 
 
 # ============ 路径解析 (同时支持源码运行与 exe 运行) ============
