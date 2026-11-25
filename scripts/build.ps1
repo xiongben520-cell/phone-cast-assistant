@@ -29,6 +29,7 @@ try {
         --add-data "src\ocr_helper.ps1;." `
         --hidden-import win32util --hidden-import qr_locator --hidden-import agent_bridge --hidden-import ad_skip `
         --collect-all qrcode `
+        --collect-all pycaw --collect-all comtypes `
         --hidden-import cv2 --hidden-import numpy `
         --hidden-import PIL.ImageTk --hidden-import PIL._tkinter_finder `
         (Join-Path $Root "src\app_main.py")

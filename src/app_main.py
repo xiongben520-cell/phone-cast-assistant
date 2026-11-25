@@ -29,8 +29,13 @@ try:
 except Exception:  # 缺模块时不让整个 GUI 起不来
     ad_skip = None
 
+try:
+    import pc_volume
+except Exception:
+    pc_volume = None
+
 APP_NAME = "手机投屏连接助手"
-APP_VER = "1.6.4"
+APP_VER = "1.6.6"
 
 
 # ============ 路径解析 (同时支持源码运行与 exe 运行) ============
@@ -455,6 +460,10 @@ class App(tk.Tk):
         self._cast_volume_before = 0
         self._last_cast_serial = None
         self._release_lock = threading.Lock()
+        # 手机音量 -> PC 音量同步（投屏期间）
+        self._vol_sync_stop = threading.Event()
+        self._vol_sync_thread = None
+        self._pc_volume = None
         self.ad_skip_watcher = None
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1703,9 +1712,9 @@ class App(tk.Tk):
         self._last_cast_serial = serial
         if orig_vol is None or orig_vol <= 0:
             back = set_media_volume(serial, self._cast_volume_before)
-            self.log(f"     媒体音量已从 0 恢复到 {back}（scrcpy 抓音需要非零音量）")
+            self.log(f"     媒体音量从 0 恢复到 {back}（断开后手机耳机要能出声）")
         else:
-            self.log(f"     媒体音量 {orig_vol}（投屏期间保持不变）")
+            self.log(f"     媒体音量 {orig_vol}（断开后会恢复这个值，耳机正常出声）")
 
         # 3. scrcpy
         self.log("[3/4] 启动 scrcpy ...")
@@ -1713,8 +1722,12 @@ class App(tk.Tk):
         time.sleep(1.5)
         # 不再 --turn-screen-off: 面板断电时安全界面(锁屏/密码)不会渲染进视频,
         # 触摸事件也会被系统丢弃, 导致"看得见却点不了"。改成亮屏 + --keep-active。
+        # 音频源用 playback 而不是 output：
+        # output 靠 remote_submix，手机插有线耳机时系统把 STREAM_MUSIC 路由到
+        # line(20000)，remote_submix 里没有数据 -> 电脑没声音；
+        # playback 直接抓 App 播放流，不受输出设备路由影响，实测插耳机也能抓到。
         argline = (f'-s "{serial}" --keep-active '
-                   f'--audio-source=output --audio-buffer=200 --audio-output-buffer=50 '
+                   f'--audio-source=playback --audio-buffer=200 --audio-output-buffer=50 '
                    f'--max-fps=60 --video-bit-rate={bitrate}M --print-fps')
         logf = os.path.join(BASE, "scrcpy_run.log")
         errf = os.path.join(BASE, "scrcpy_run.err")
@@ -1741,13 +1754,15 @@ class App(tk.Tk):
             return
         self.log(f"      scrcpy PID={self.scrcpy_proc.pid} 运行中")
         self._save_device_state(connected=True, bitrate=bitrate)
+        self._start_volume_sync(serial, self.scrcpy_proc.pid)
         self.screen_on = True
         self._set_screen_label()
         self._start_anchor()
 
-        # 4. 测试音
-        self.log("[4/4] 播放测试音 ...")
-        self._ping(serial)
+        # 4. 音频确认：playback 源只抓 App 播放流，系统提示音(STREAM_SYSTEM)不经过它，
+        #    所以不再用铃声切换做测试音，改提示用户播放视频确认。
+        self.log("[4/4] 音频源=playback（插耳机也能抓到 App 声音）")
+        self.log("     请播放一段视频确认电脑端有声音；系统提示音不经过 playback 源")
         self.log("连接完成 —— 手机保持亮屏，锁屏/密码界面可见可点")
         self.log("提示: 小米若锁屏界面点不动，需在手机「开发者选项」打开")
         self.log("      「USB调试（安全设置）」，否则系统禁止模拟点击安全界面")
@@ -1815,6 +1830,49 @@ class App(tk.Tk):
         except Exception as e:
             self.log(f"贴图启动失败: {e}")
 
+    # ---------- 手机音量 -> PC 音量同步 ----------
+    def _start_volume_sync(self, serial, scrcpy_pid):
+        """投屏期间把手机媒体音量映射到「投屏窗口」自己的音量（0..150 -> 0..100%）。
+        只改 scrcpy.exe 这个进程的音量，不动 Windows 系统主音量。
+        playback 源在音量控制前抓流，手机音量不会自然传到 PC，必须显式同步。"""
+        self._vol_sync_stop.clear()
+        if pc_volume is None:
+            self.log("投屏窗口音量同步不可用：缺少 pc_volume 模块")
+            return
+        try:
+            self._pc_volume = pc_volume.ScrcpyVolume(scrcpy_pid)
+            self.log("手机音量已接管投屏窗口音量（系统主音量不变）")
+        except Exception as e:
+            self.log(f"投屏窗口音量同步启动失败: {e}")
+            return
+
+        def loop():
+            last = None
+            while not self._vol_sync_stop.is_set():
+                try:
+                    v = get_media_volume(serial)
+                    if v is not None and v != last:
+                        # 音频会话可能晚于 scrcpy 进程创建：设置失败就不更新 last，下轮重试
+                        if self._pc_volume.set(v / 150.0):
+                            last = v
+                            self.after(0, lambda val=v: self.log(
+                                "手机音量 %d/150 -> 投屏窗口 %.0f%%"
+                                % (val, val / 150.0 * 100)))
+                except Exception:
+                    pass
+                self._vol_sync_stop.wait(0.6)
+
+        self._vol_sync_thread = threading.Thread(target=loop, daemon=True)
+        self._vol_sync_thread.start()
+
+    def _stop_volume_sync(self):
+        self._vol_sync_stop.set()
+        if self._vol_sync_thread and self._vol_sync_thread.is_alive():
+            self._vol_sync_thread.join(timeout=2)
+        self._vol_sync_thread = None
+        # scrcpy 退出后它的音频会话自然消失，不需要恢复系统音量
+        self._pc_volume = None
+
     # ---------- 断开收尾：暂停播放 + 防外泄 ----------
     def _release_cast(self, reason):
         """投屏断开统一收尾：暂停手机播放并把媒体音量归零，
@@ -1825,8 +1883,11 @@ class App(tk.Tk):
             if serial:
                 try:
                     pause_phone_playback(serial)
-                    final = set_media_volume(serial, 0)
-                    self.log(f"[{reason}] 已暂停手机播放，媒体音量归零（当前 {final}）")
+                    # 暂停后已经没有声音了，音量恢复到连接前的值，
+                    # 这样断开后手机耳机能正常出声；不是归零。
+                    restore = self._cast_volume_before or TARGET_VOLUME
+                    final = set_media_volume(serial, restore)
+                    self.log(f"[{reason}] 已暂停手机播放，媒体音量恢复到 {final}（耳机可正常出声）")
                 except Exception as e:
                     self.log(f"[{reason}] 暂停/静音失败: {e}")
             else:
