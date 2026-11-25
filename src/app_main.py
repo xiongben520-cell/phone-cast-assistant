@@ -1847,6 +1847,8 @@ class App(tk.Tk):
             return
 
         def loop():
+            # COM 必须在本线程初始化：comtypes/pycaw 在子线程未初始化时拿不到音频会话
+            pc_volume.init_com()
             last = None
             while not self._vol_sync_stop.is_set():
                 try:

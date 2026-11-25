@@ -5,11 +5,23 @@
 ISimpleAudioVolume。手机媒体音量 0..150 映射到该会话音量 0.0..1.0。
 
 依赖：pycaw + comtypes（均已加入 build.ps1 的 --collect-all）。
+
+重要：COM 必须在调用线程里初始化。同步跑在子线程，所以每个线程都要 CoInitialize。
 """
+import ctypes
+
 try:
     from pycaw.pycaw import AudioUtilities
 except Exception:
     AudioUtilities = None
+
+
+def init_com():
+    """在本线程初始化 COM（子线程必须调用，否则 GetAllSessions 返回空/设置失败）"""
+    try:
+        ctypes.windll.ole32.CoInitialize(None)
+    except Exception:
+        pass
 
 
 class ScrcpyVolume:
