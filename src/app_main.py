@@ -35,7 +35,7 @@ except Exception:
     pc_volume = None
 
 APP_NAME = "手机投屏连接助手"
-APP_VER = "1.6.7"
+APP_VER = "1.6.8"
 
 
 # ============ 路径解析 (同时支持源码运行与 exe 运行) ============
@@ -495,6 +495,8 @@ class App(tk.Tk):
                         if (self.scrcpy_proc is not None
                                 and self.scrcpy_proc.poll() is not None):
                             self._release_cast("scrcpy 意外退出")
+                            self._restore_volume()
+                            self._stop_volume_sync()
                             self.scrcpy_proc = None
                             self.after(0, lambda: self.log(
                                 "scrcpy 已退出，手机播放已暂停并静音"))
@@ -530,6 +532,8 @@ class App(tk.Tk):
             if self.serial in gone:
                 clear_serial = True
                 self._release_cast("设备断开")
+                self._restore_volume()
+                self._stop_volume_sync()
                 kind = "数据线被拔出或USB调试被关闭" if is_usb_serial(gone[0]) \
                        else "无线调试断开或Wi-Fi切换"
                 msgs.append(f"   -> 可能是{kind}")
@@ -1000,9 +1004,11 @@ class App(tk.Tk):
         except Exception:
             pass
         try:
-            # 关窗口也是断开：暂停播放 + 静音，并收掉 scrcpy 孤儿进程
+            # 关窗口也是断开：先暂停并等待，再收 scrcpy，最后恢复音量
             self._release_cast("关闭程序")
             run(["taskkill", "/F", "/IM", "scrcpy.exe", "/T"], timeout=15)
+            self._restore_volume()
+            self._stop_volume_sync()
         except Exception:
             pass
         self.destroy()
@@ -1875,25 +1881,39 @@ class App(tk.Tk):
         # scrcpy 退出后它的音频会话自然消失，不需要恢复系统音量
         self._pc_volume = None
 
-    # ---------- 断开收尾：暂停播放 + 防外泄 ----------
+    # ---------- 断开收尾：先暂停、后断 scrcpy，杜绝漏音 ----------
     def _release_cast(self, reason):
-        """投屏断开统一收尾：暂停手机播放并把媒体音量归零，
-        避免 scrcpy 退出后音频路由回到扬声器、手机继续外放。
-        主线程与 watchdog 后台线程都可能调用，内部加锁防重复。"""
+        """断开**之前**调用：暂停手机播放并等它真正停下来。
+
+        顺序很关键：scrcpy 还在跑时手机音频走 playback 抓流、不外放；
+        必须等 App 真的暂停后，调用方才 taskkill scrcpy（路由回到扬声器）。
+        以前是先发暂停就 taskkill，App 响应慢会漏 0.x 秒声音。
+        音量恢复不在这里做，放到 scrcpy 退出后的 _restore_volume()。
+        """
         with self._release_lock:
             serial = self._last_cast_serial or self.serial
             if serial:
                 try:
                     pause_phone_playback(serial)
-                    # 暂停后已经没有声音了，音量恢复到连接前的值，
-                    # 这样断开后手机耳机能正常出声；不是归零。
-                    restore = self._cast_volume_before or TARGET_VOLUME
-                    final = set_media_volume(serial, restore)
-                    self.log(f"[{reason}] 已暂停手机播放，媒体音量恢复到 {final}（耳机可正常出声）")
+                    # 等 App 响应暂停：keyevent 127 发出后播放器不是立刻停
+                    self._stop_volume_sync.wait(0.4)
+                    self.log(f"[{reason}] 已暂停手机播放，等待 scrcpy 退出")
                 except Exception as e:
-                    self.log(f"[{reason}] 暂停/静音失败: {e}")
+                    self.log(f"[{reason}] 暂停失败: {e}")
             else:
-                self.log(f"[{reason}] 无设备串号，跳过暂停/静音")
+                self.log(f"[{reason}] 无设备串号，跳过暂停")
+
+    def _restore_volume(self):
+        """scrcpy 退出后恢复手机音量：此时播放已暂停，不会再漏音。"""
+        with self._release_lock:
+            serial = self._last_cast_serial or self.serial
+            restore = self._cast_volume_before or TARGET_VOLUME
+            if serial and restore:
+                try:
+                    final = set_media_volume(serial, restore)
+                    self.log(f"手机音量已恢复到 {final}（播放已暂停，无外泄）")
+                except Exception as e:
+                    self.log(f"恢复手机音量失败: {e}")
             self._last_cast_serial = None
             self._cast_volume_before = 0
 
@@ -1901,6 +1921,8 @@ class App(tk.Tk):
     def disconnect_all(self):
         self._release_cast("手动断开")
         run(["taskkill", "/F", "/IM", "scrcpy.exe", "/T"])
+        self._restore_volume()
+        self._stop_volume_sync()
         self._anchor_stop.set()
         self.scrcpy_proc = None
         self.screen_on = True
