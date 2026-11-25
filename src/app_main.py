@@ -35,7 +35,7 @@ except Exception:
     pc_volume = None
 
 APP_NAME = "手机投屏连接助手"
-APP_VER = "1.6.8"
+APP_VER = "1.6.9"
 
 
 # ============ 路径解析 (同时支持源码运行与 exe 运行) ============
@@ -460,6 +460,9 @@ class App(tk.Tk):
         self._cast_volume_before = 0
         self._last_cast_serial = None
         self._release_lock = threading.Lock()
+        # 点 scrcpy 窗口 × 的快速响应（不依赖 5 秒 watchdog）
+        self._intentional_disconnect = False
+        self._scrcpy_exit_handled = False
         # 手机音量 -> PC 音量同步（投屏期间）
         self._vol_sync_stop = threading.Event()
         self._vol_sync_thread = None
@@ -493,7 +496,10 @@ class App(tk.Tk):
                         interval = 5.0
                         # scrcpy 自己崩掉/被杀时也算断开，必须暂停播放并静音
                         if (self.scrcpy_proc is not None
-                                and self.scrcpy_proc.poll() is not None):
+                                and self.scrcpy_proc.poll() is not None
+                                and not self._scrcpy_exit_handled
+                                and not self._intentional_disconnect):
+                            self._scrcpy_exit_handled = True
                             self._release_cast("scrcpy 意外退出")
                             self._restore_volume()
                             self._stop_volume_sync()
@@ -1009,6 +1015,7 @@ class App(tk.Tk):
             run(["taskkill", "/F", "/IM", "scrcpy.exe", "/T"], timeout=15)
             self._restore_volume()
             self._stop_volume_sync()
+            self._intentional_disconnect = True
         except Exception:
             pass
         self.destroy()
@@ -1761,6 +1768,9 @@ class App(tk.Tk):
         self.log(f"      scrcpy PID={self.scrcpy_proc.pid} 运行中")
         self._save_device_state(connected=True, bitrate=bitrate)
         self._start_volume_sync(serial, self.scrcpy_proc.pid)
+        self._intentional_disconnect = False
+        self._scrcpy_exit_handled = False
+        self._start_scrcpy_exit_watch(self.scrcpy_proc)
         self.screen_on = True
         self._set_screen_label()
         self._start_anchor()
@@ -1917,12 +1927,45 @@ class App(tk.Tk):
             self._last_cast_serial = None
             self._cast_volume_before = 0
 
+    def _start_scrcpy_exit_watch(self, proc):
+        """快速监视 scrcpy 进程：点窗口 × 或它崩溃退出时，0.2s 内就暂停手机。
+        不依赖 5 秒的设备 watchdog（那是"没暂停"的根因）。
+        点程序「断开」按钮时 _intentional_disconnect=True，这里直接跳过，基线不动。
+        """
+        def loop():
+            while not self._watchdog_stop.is_set():
+                if proc.poll() is None:
+                    self._watchdog_stop.wait(0.2)
+                    continue
+                if self._intentional_disconnect or self._scrcpy_exit_handled:
+                    return
+                self._scrcpy_exit_handled = True
+                serial = self._last_cast_serial or self.serial
+                if serial:
+                    try:
+                        # scrcpy 已退出、音频路由已回扬声器：先暂停再静音，刻不容缓
+                        pause_phone_playback(serial)
+                        set_media_volume(serial, 0)
+                        self._stop_volume_sync.wait(0.3)
+                        restore = self._cast_volume_before or TARGET_VOLUME
+                        set_media_volume(serial, restore)
+                        self.log("[监视] scrcpy 已退出（点×或崩溃），手机播放已暂停、音量已恢复")
+                    except Exception as e:
+                        self.log(f"[监视] 暂停失败: {e}")
+                self._stop_volume_sync()
+                self._last_cast_serial = None
+                self._cast_volume_before = 0
+                return
+        threading.Thread(target=loop, daemon=True).start()
+
     # ---------- 断开 ----------
     def disconnect_all(self):
+        self._intentional_disconnect = True
         self._release_cast("手动断开")
         run(["taskkill", "/F", "/IM", "scrcpy.exe", "/T"])
         self._restore_volume()
         self._stop_volume_sync()
+        self._intentional_disconnect = False
         self._anchor_stop.set()
         self.scrcpy_proc = None
         self.screen_on = True
